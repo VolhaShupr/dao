@@ -3,10 +3,6 @@ pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-// import "@openzeppelin/contracts/utils/Counters.sol";
-
-// import "hardhat/console.sol";
-// console.log("Changing greeting from '%s' to '%s'", greeting, _greeting);
 
 contract DAO is Ownable {
 
@@ -17,33 +13,42 @@ contract DAO is Ownable {
     uint public quorumPercentage;
     uint public debatePeriod;
 
+    uint private _currentProposalId;
+
     struct Proposal {
+        // is id redundant or is it better to duplicate id inside the structure (considering that it is used as the mapping key)?
         uint proposalId;
-        bytes callData;
+        bytes callData; // calldata to be passed to a call
         address recipient;
-        string description; // todo pass in bytes hash?
-        uint startDate;
-        uint votesFor;
-        uint votesAgainst;
-        bool isActive; // todo check do we need it
+        bytes32 descriptionHash;
+        uint endDate; // The timestamp when the proposal will be available for execution
+        uint votesFor; // number of votes for the proposal
+        uint votesAgainst; // number of votes against the proposal
+        bool isActive; // whether the proposal has been in process fo voting
         mapping(address => bool) participants;
     }
 
-    // using Counters for Counters.Counter;
-    // Counters.Counter private _currentProposalId;
-    uint private _currentProposalId;
+    struct Voter {
+        uint deposit;
+        uint withdrawTime;
+    }
 
     /// @dev _currentProposalId => Proposal mapping of proposals
     mapping (uint => Proposal) private _proposals;
 
-    mapping (address => uint) private _deposits;
+    mapping (address => Voter) private _voters;
 
-    mapping (address => uint) private _latestVotes;
+    enum ProposalResult {
+        Success,
+        ExecutionError,
+        NotEnoughVotesReject,
+        VotedAgainstReject
+    }
 
     event Deposited(address indexed from, uint amount);
     event ProposalAdded(uint indexed proposalId, address indexed recipient, string description);
     event Voted(uint indexed proposalId, address indexed voter, bool isVoteForProposal);
-    event VotingFinished(uint indexed proposalId, bool isSuccessful, string error);
+    event VotingFinished(uint indexed proposalId, ProposalResult status);
     event Withdrawn(address indexed recipient, uint amount);
 
     constructor(address _chairPerson, address _votingToken, uint _minQuorumPercentage, uint _debatingPeriodDuration) {
@@ -55,43 +60,44 @@ contract DAO is Ownable {
 
     function deposit(uint amount) external {
         require(amount > 0, "Not valid amount");
-        // todo add the following check?
-        // require(voteToken.safeTransferFrom(msg.sender, address(this), amount), "Transfer failed");
+
         voteToken.safeTransferFrom(msg.sender, address(this), amount);
-        _deposits[msg.sender] += amount;
+        _voters[msg.sender].deposit += amount;
 
         emit Deposited(msg.sender, amount);
     }
 
-    function addProposal(address recipient, bytes memory callData, string memory description) external {
+    function addProposal(address recipient, bytes calldata callData, string calldata description) external {
         require(chairPerson == msg.sender, "Not enough permissions");
-        require(recipient != address(0), "Not valid address");
-
-//        _currentProposalId.increment();
-//        uint proposalId = _currentProposalId.current();
+        require(recipient != address(0), "Not valid target address");
 
         _currentProposalId = _currentProposalId + 1;
         Proposal storage proposal = _proposals[_currentProposalId];
         proposal.proposalId = _currentProposalId;
         proposal.callData = callData;
         proposal.recipient = recipient;
-        proposal.description = description;
-        proposal.startDate = block.timestamp;
+        proposal.descriptionHash = keccak256(bytes(description));
+        proposal.endDate = block.timestamp + debatePeriod;
         proposal.isActive = true;
 
         emit ProposalAdded(_currentProposalId, recipient, description);
     }
 
     function vote(uint proposalId, bool isVoteForProposal) external {
-        uint senderDeposit = _deposits[msg.sender];
+        Voter storage voter = _voters[msg.sender];
+        uint senderDeposit = voter.deposit;
         require(senderDeposit > 0, "Voters should deposit some amount first");
 
         Proposal storage proposal = _proposals[proposalId];
-        require(proposal.proposalId > 0 && proposal.isActive, "Proposal is not active or not exist");
+        require(proposal.proposalId > 0 && proposal.endDate > block.timestamp, "Proposal is not active or doesn't exist");
         require(!proposal.participants[msg.sender], "Already voted");
 
         proposal.participants[msg.sender] = true;
-        _latestVotes[msg.sender] = proposal.startDate;
+
+        // condition returns `false` when debate period for a new proposal has been updated to the shorter one
+        if (proposal.endDate > voter.withdrawTime) {
+            voter.withdrawTime = proposal.endDate;
+        }
 
         if (isVoteForProposal) {
             proposal.votesFor += senderDeposit;
@@ -104,40 +110,37 @@ contract DAO is Ownable {
 
     function finish(uint proposalId) external {
         Proposal storage proposal = _proposals[proposalId];
-        require(proposal.proposalId > 0 && proposal.isActive, "Proposal is not active or not exist");
-        require((block.timestamp - proposal.startDate) > debatePeriod, "Voting cannot be finished now");
-
-        uint quorum = voteToken.totalSupply() * quorumPercentage / 100;
-
-        // todo refactor
-        if ((proposal.votesFor + proposal.votesAgainst) <= quorum) {
-            emit VotingFinished(proposal.proposalId, false, "Not enough votes");
-        } else if (proposal.votesFor <= proposal.votesAgainst) {
-            emit VotingFinished(proposal.proposalId, false, "The majority voted against");
-        } else {
-            (bool success,) = proposal.recipient.call(proposal.callData);
-            if (!success) {
-                emit VotingFinished(proposal.proposalId, false, "Proposal execution error");
-            } else {
-                emit VotingFinished(proposal.proposalId, true, "");
-            }
-
-        }
+        require(proposal.proposalId > 0 && proposal.isActive, "Proposal is not active or doesn't exist");
+        require(proposal.endDate <= block.timestamp, "Voting cannot be finished now");
 
         proposal.isActive = false;
 
+        ProposalResult proposalResult;
+        uint quorum = voteToken.totalSupply() * quorumPercentage / 100;
+
+        if ((proposal.votesFor + proposal.votesAgainst) <= quorum) {
+            proposalResult = ProposalResult.NotEnoughVotesReject;
+        } else if (proposal.votesFor <= proposal.votesAgainst) {
+            proposalResult = ProposalResult.VotedAgainstReject;
+        } else {
+            (bool success, ) = proposal.recipient.call(proposal.callData);
+            proposalResult = success ? ProposalResult.Success : ProposalResult.ExecutionError;
+        }
+
+        emit VotingFinished(proposal.proposalId, proposalResult);
     }
 
     function withdraw() external {
-        uint userDeposit = _deposits[msg.sender];
-        require(userDeposit > 0, "Voters should deposit some amount first");
-        require((_latestVotes[msg.sender] == 0) || (block.timestamp - _latestVotes[msg.sender] > debatePeriod), "Voters with an active proposal cannot withdraw");
+        Voter storage voter = _voters[msg.sender];
+        uint userDeposit = voter.deposit;
 
-        _deposits[msg.sender] = 0;
+        require(userDeposit > 0, "Voters should deposit some amount first");
+        require(block.timestamp > voter.withdrawTime, "Voters with an active proposal cannot withdraw");
+
+        voter.deposit = 0;
         voteToken.safeTransfer(msg.sender, userDeposit);
 
         emit Withdrawn(msg.sender, userDeposit);
-
     }
 
     /**

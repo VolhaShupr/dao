@@ -18,6 +18,13 @@ interface Proposal {
   description: string;
 }
 
+enum ProposalResult {
+  Success,
+  ExecutionError,
+  NotEnoughVotesReject,
+  VotedAgainstReject
+}
+
 describe("DAO", () => {
   const tokenInitialSupply = toBigNumber(100);
   const accountBalance = toBigNumber(30);
@@ -109,7 +116,7 @@ describe("DAO", () => {
     it("Should revert when proposal recipient is zero address", async () => {
       await expect(dao.connect(chairPerson).addProposal(
         ZERO_ADDRESS, proposal.callData, proposal.description,
-      )).to.be.revertedWith("Not valid address");
+      )).to.be.revertedWith("Not valid target address");
     });
 
     it("Should add a proposal", async () => {
@@ -138,8 +145,8 @@ describe("DAO", () => {
       await expect(dao.connect(voter2).vote(proposalId, true)).to.be.revertedWith("Voters should deposit some amount first");
     });
 
-    it("Should revert when proposal is not exist", async () => {
-      await expect(dao.connect(voter1).vote(2, false)).to.be.revertedWith("Proposal is not active or not exist");
+    it("Should revert when proposal doesn't exist", async () => {
+      await expect(dao.connect(voter1).vote(2, false)).to.be.revertedWith("Proposal is not active or doesn't exist");
     });
 
     it("Should revert when user has already voted for the proposal", async () => {
@@ -163,8 +170,8 @@ describe("DAO", () => {
       await dao.connect(voter1).vote(proposalId, isVoteFor);
     });
 
-    it("Should revert when proposal is not exist", async () => {
-      await expect(dao.finish(2)).to.be.revertedWith("Proposal is not active or not exist");
+    it("Should revert when proposal doesn't exist", async () => {
+      await expect(dao.finish(2)).to.be.revertedWith("Proposal is not active or doesn't exist");
     });
 
     it("Should revert when voting period is not over yet", async () => {
@@ -173,11 +180,10 @@ describe("DAO", () => {
 
     it("Should unsuccessfully finish the voting when the number of votes is less than quorum", async () => {
       await increaseTime(debatingPeriodDuration + 1);
-      const isSuccess = false;
 
       await expect(dao.finish(proposalId))
         .to.emit(dao, "VotingFinished")
-        .withArgs(proposalId, isSuccess, "Not enough votes");
+        .withArgs(proposalId, ProposalResult.NotEnoughVotesReject);
     });
 
     it("Should unsuccessfully finish the voting when the number of votes for proposal is less than against", async () => {
@@ -186,10 +192,9 @@ describe("DAO", () => {
       await dao.connect(voter2).vote(proposalId, isVoteFor);
       await increaseTime(debatingPeriodDuration + 1);
 
-      const isSuccess = false;
       await expect(dao.finish(proposalId))
         .to.emit(dao, "VotingFinished")
-        .withArgs(proposalId, isSuccess, "The majority voted against");
+        .withArgs(proposalId, ProposalResult.VotedAgainstReject);
     });
 
     it("Should unsuccessfully finish the voting when proposal has been not executed", async () => {
@@ -198,10 +203,9 @@ describe("DAO", () => {
       await dao.connect(voter2).vote(proposalId, isVoteFor);
       await increaseTime(debatingPeriodDuration + 1);
 
-      const isSuccess = false;
       await expect(dao.finish(proposalId))
         .to.emit(dao, "VotingFinished")
-        .withArgs(proposalId, isSuccess, "Proposal execution error");
+        .withArgs(proposalId, ProposalResult.ExecutionError);
     });
 
     it("Should successfully finish the voting and execute the proposal", async () => {
@@ -213,10 +217,9 @@ describe("DAO", () => {
       await dao.connect(voter2).vote(proposalId, isVoteFor);
       await increaseTime(debatingPeriodDuration + 1);
 
-      const isSuccess = true;
       await expect(dao.finish(proposalId))
         .to.emit(dao, "VotingFinished")
-        .withArgs(proposalId, isSuccess, "");
+        .withArgs(proposalId, ProposalResult.Success);
 
       // checks that proposal has been executed
       expect(await votingToken.totalSupply()).to.equal(tokenInitialSupply.mul(2));
@@ -227,10 +230,8 @@ describe("DAO", () => {
   describe("[withdraw]", () => {
     beforeEach(async () => {
       await dao.connect(chairPerson).addProposal(proposal.recipientAddress, proposal.callData, proposal.description);
-
-      const isVoteFor = true;
       await dao.connect(voter1).deposit(depositAmount);
-      await dao.connect(voter1).vote(proposalId, isVoteFor);
+      await dao.connect(voter1).vote(proposalId, true);
       await dao.connect(voter2).deposit(depositAmount);
     });
 
@@ -242,6 +243,22 @@ describe("DAO", () => {
       await expect(dao.connect(voter1).withdraw()).to.be.revertedWith("Voters with an active proposal cannot withdraw");
     });
 
+    it("Should revert when user participates in still active votings in case of changing debate period to a shorter one", async () => {
+      // user votes when debate period is 3 days
+      await dao.connect(voter2).vote(proposalId, true);
+
+      // change debate period to 2 days and add new proposal
+      const newDebatePeriod = 2 * 24 * 60 * 60;
+      await dao.updateDebatePeriod(newDebatePeriod);
+      await dao.connect(chairPerson).addProposal(proposal.recipientAddress, proposal.callData, proposal.description);
+
+      // user votes when debate period is 2 days
+      await dao.connect(voter2).vote(proposalId + 1, true);
+
+      await increaseTime(newDebatePeriod + 4 * 60 * 60);
+      await expect(dao.connect(voter2).withdraw()).to.be.revertedWith("Voters with an active proposal cannot withdraw");
+    });
+
     it("Should withdraw tokens", async () => {
       await increaseTime(debatingPeriodDuration + 1);
       // await dao.finish(proposalId);
@@ -250,6 +267,7 @@ describe("DAO", () => {
         .to.emit(dao, "Withdrawn")
         .withArgs(voter1Address, depositAmount);
 
+      await expect(dao.connect(voter1).withdraw()).to.be.revertedWith("Voters should deposit some amount first");
       expect(await votingToken.balanceOf(voter1Address)).to.equal(accountBalance);
       expect(await votingToken.balanceOf(daoAddress)).to.equal(depositAmount); // from voter2
 
@@ -259,7 +277,7 @@ describe("DAO", () => {
     });
   });
 
-  describe("After voting has been finished", () => {
+  describe("After the voting has been finished", () => {
     beforeEach(async () => {
       // const daoRole = ethers.utils.id("DAO_ROLE");
       // await votingToken.grantRole(daoRole, daoAddress);
@@ -277,21 +295,42 @@ describe("DAO", () => {
 
     it("[vote] Should revert when proposal has been already finished", async () => {
       await dao.connect(voter3).deposit(depositAmount);
-      await expect(dao.connect(voter3).vote(proposalId, false)).to.be.revertedWith("Proposal is not active or not exist");
+      await expect(dao.connect(voter3).vote(proposalId, false)).to.be.revertedWith("Proposal is not active or doesn't exist");
     });
 
     it("[finish] Should revert when proposal has been already finished", async () => {
-      await expect(dao.finish(proposalId)).to.be.revertedWith("Proposal is not active or not exist");
+      await expect(dao.finish(proposalId)).to.be.revertedWith("Proposal is not active or doesn't exist");
     });
 
   });
 
   describe("admin", () => {
-    it("[updateDebatingPeriod] Should set a new debating period", async () => {
+    it("[updateDebatePeriod] Should set a new debating period", async () => {
       const newDebatePeriod = 5 * 24 * 60 * 60; // 5 days;
 
       await dao.updateDebatePeriod(newDebatePeriod);
       expect(await dao.debatePeriod()).to.equal(newDebatePeriod);
+    });
+
+    it("[updateQuorumPercentage] Should set a new quorum value", async () => {
+      const newQuorumPercentage = 0; // 0%;
+
+      await dao.updateQuorumPercentage(newQuorumPercentage);
+      expect(await dao.quorumPercentage()).to.equal(newQuorumPercentage);
+
+      // nobody voted
+      await dao.connect(chairPerson).addProposal(proposal.recipientAddress, proposal.callData, proposal.description);
+      await increaseTime(debatingPeriodDuration + 1);
+      await expect(dao.finish(proposalId))
+        .to.emit(dao, "VotingFinished")
+        .withArgs(proposalId, ProposalResult.NotEnoughVotesReject);
+    });
+
+    it("[updateChairPerson] Should set a new debating period", async () => {
+      const newChairPerson = voter3Address;
+
+      await dao.updateChairPerson(newChairPerson);
+      expect(await dao.chairPerson()).to.equal(newChairPerson);
     });
   });
 
